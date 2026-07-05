@@ -7,7 +7,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: quorinex/freebuff2api
+  IMAGE_NAME: gelvey/freebuff2api
 
 jobs:
   build:
