@@ -27,6 +27,7 @@ const (
 
 type freeSessionResponse struct {
 	Status                 string `json:"status"`
+	Model                  string `json:"model"`
 	InstanceID             string `json:"instanceId"`
 	Position               int    `json:"position"`
 	QueueDepth             int    `json:"queueDepth"`
@@ -40,6 +41,7 @@ type freeSessionResponse struct {
 
 type cachedSession struct {
 	status     sessionStatus
+	model      string
 	instanceID string
 	expiresAt  time.Time
 	position   int
@@ -48,10 +50,10 @@ type cachedSession struct {
 	retryAfter time.Duration
 }
 
-func (p *tokenPool) ensureSession(ctx context.Context) (string, error) {
+func (p *tokenPool) ensureSession(ctx context.Context, requestedModel string) (string, error) {
 	for {
 		p.mu.Lock()
-		if instanceID, ready := p.readySessionLocked(time.Now()); ready {
+		if instanceID, ready := p.readySessionLocked(requestedModel, time.Now()); ready {
 			p.mu.Unlock()
 			return instanceID, nil
 		}
@@ -72,7 +74,7 @@ func (p *tokenPool) ensureSession(ctx context.Context) (string, error) {
 		p.sessionRefreshCh = ch
 		p.mu.Unlock()
 
-		session, instanceID, err := p.refreshSession(ctx)
+		session, instanceID, err := p.refreshSession(ctx, requestedModel)
 
 		p.mu.Lock()
 		if session != nil {
@@ -99,8 +101,13 @@ func (p *tokenPool) ensureSession(ctx context.Context) (string, error) {
 	}
 }
 
-func (p *tokenPool) readySessionLocked(now time.Time) (string, bool) {
+func (p *tokenPool) readySessionLocked(requestedModel string, now time.Time) (string, bool) {
 	if p.session == nil {
+		return "", false
+	}
+	// Model-specific sessions are queued per-model; switch models to avoid
+	// using a session bound to a different model.
+	if requestedModel != "" && strings.TrimSpace(p.session.model) != "" && requestedModel != p.session.model {
 		return "", false
 	}
 	switch p.session.status {
@@ -117,7 +124,20 @@ func (p *tokenPool) readySessionLocked(now time.Time) (string, bool) {
 	return "", false
 }
 
-func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string, error) {
+func (p *tokenPool) createOrRefreshSession(ctx context.Context, requestedModel string) (freeSessionResponse, error) {
+	state, err := p.client.CreateOrRefreshSession(ctx, p.token, requestedModel)
+	if err == nil || requestedModel == "" || !strings.Contains(err.Error(), `"status":"model_locked"`) {
+		return state, err
+	}
+
+	p.invalidateSession("")
+	if endErr := p.client.EndSession(ctx, p.token); endErr != nil {
+		return freeSessionResponse{}, fmt.Errorf("end model-locked free session: %w", endErr)
+	}
+	return p.client.CreateOrRefreshSession(ctx, p.token, requestedModel)
+}
+
+func (p *tokenPool) refreshSession(ctx context.Context, requestedModel string) (*cachedSession, string, error) {
 	p.mu.Lock()
 	current := p.session
 	p.mu.Unlock()
@@ -132,7 +152,7 @@ func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string,
 			return nil, "", fmt.Errorf("poll free session: %w", err)
 		}
 	} else {
-		state, err = p.client.CreateOrRefreshSession(ctx, p.token)
+		state, err = p.createOrRefreshSession(ctx, requestedModel)
 		if err != nil {
 			return nil, "", fmt.Errorf("start free session: %w", err)
 		}
@@ -153,6 +173,7 @@ func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string,
 			}
 			return &cachedSession{
 				status:     sessionStatusActive,
+				model:      state.Model,
 				instanceID: instanceID,
 				expiresAt:  expiresAt,
 			}, instanceID, nil
@@ -165,6 +186,7 @@ func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string,
 			delay := queuedPollDelay(state)
 			return &cachedSession{
 				status:     sessionStatusQueued,
+				model:      state.Model,
 				instanceID: instanceID,
 				position:   maxInt(state.Position, 1),
 				queueDepth: maxInt(state.QueueDepth, maxInt(state.Position, 1)),
@@ -172,7 +194,7 @@ func (p *tokenPool) refreshSession(ctx context.Context) (*cachedSession, string,
 				retryAfter: delay,
 			}, "", nil
 		case sessionStatusNone, sessionStatusEnded, sessionStatusSuperseded:
-			state, err = p.client.CreateOrRefreshSession(ctx, p.token)
+			state, err = p.createOrRefreshSession(ctx, requestedModel)
 			if err != nil {
 				return nil, "", fmt.Errorf("refresh free session: %w", err)
 			}
@@ -286,12 +308,12 @@ func (p *tokenPool) endSession(ctx context.Context) error {
 	return nil
 }
 
-func (c *UpstreamClient) CreateOrRefreshSession(ctx context.Context, authToken string) (freeSessionResponse, error) {
-	return c.doSessionRequest(ctx, http.MethodPost, authToken, "")
+func (c *UpstreamClient) CreateOrRefreshSession(ctx context.Context, authToken, model string) (freeSessionResponse, error) {
+	return c.doSessionRequest(ctx, http.MethodPost, authToken, "", model)
 }
 
 func (c *UpstreamClient) GetSession(ctx context.Context, authToken, instanceID string) (freeSessionResponse, error) {
-	return c.doSessionRequest(ctx, http.MethodGet, authToken, instanceID)
+	return c.doSessionRequest(ctx, http.MethodGet, authToken, instanceID, "")
 }
 
 func (c *UpstreamClient) EndSession(ctx context.Context, authToken string) error {
@@ -324,7 +346,7 @@ func (c *UpstreamClient) EndSession(ctx context.Context, authToken string) error
 	return nil
 }
 
-func (c *UpstreamClient) doSessionRequest(ctx context.Context, method, authToken, instanceID string) (freeSessionResponse, error) {
+func (c *UpstreamClient) doSessionRequest(ctx context.Context, method, authToken, instanceID, model string) (freeSessionResponse, error) {
 	requestURL, err := url.JoinPath(c.baseURL, "/api/v1/freebuff/session")
 	if err != nil {
 		return freeSessionResponse{}, fmt.Errorf("build free session url: %w", err)
@@ -344,6 +366,9 @@ func (c *UpstreamClient) doSessionRequest(ctx context.Context, method, authToken
 	req.Header.Set("User-Agent", c.userAgent)
 	if method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/json")
+		if strings.TrimSpace(model) != "" {
+			req.Header.Set("x-freebuff-model", model)
+		}
 	}
 	if method == http.MethodGet && instanceID != "" {
 		req.Header.Set("x-freebuff-instance-id", instanceID)

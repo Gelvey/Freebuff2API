@@ -265,7 +265,7 @@ func (s *Server) proxyChatRequest(
 	}
 
 	for attempt := 0; attempt < 2; attempt++ {
-		lease, err := s.runs.Acquire(r.Context(), agentID)
+		lease, err := s.runs.Acquire(r.Context(), agentID, requestedModel)
 		if err != nil {
 			var waitingErr *waitingRoomError
 			if errors.As(err, &waitingErr) {
@@ -281,7 +281,7 @@ func (s *Server) proxyChatRequest(
 
 		s.logger.Printf("[%s] Routing request (model: %s) via run: %s", lease.pool.name, requestedModel, lease.run.id)
 
-		sessionInstanceID, err := lease.pool.ensureSession(r.Context())
+		sessionInstanceID, err := lease.pool.ensureSession(r.Context(), requestedModel)
 		if err != nil {
 			s.runs.Release(lease)
 			var waitingErr *waitingRoomError
@@ -365,6 +365,10 @@ func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, 
 		normalizeToolSchemas(tools)
 	}
 
+	// Upstream's free-mode gate requires a system message containing the CLI
+	// marker. Inject it if the client did not already provide one.
+	ensureFreebuffSystemMarker(cloned)
+
 	metadata, ok := cloned["codebuff_metadata"].(map[string]any)
 	if !ok || metadata == nil {
 		metadata = make(map[string]any)
@@ -382,6 +386,27 @@ func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, 
 		return nil, fmt.Errorf("marshal upstream request: %w", err)
 	}
 	return body, nil
+}
+
+const freebuffSystemMarker = "You are Buffy"
+
+func ensureFreebuffSystemMarker(payload map[string]any) {
+	messages, ok := payload["messages"].([]any)
+	if !ok {
+		return
+	}
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(fmt.Sprint(msg["role"])), "system") {
+			if strings.Contains(fmt.Sprint(msg["content"]), freebuffSystemMarker) {
+				return
+			}
+		}
+	}
+	payload["messages"] = append([]any{map[string]any{"role": "system", "content": freebuffSystemMarker}}, messages...)
 }
 
 func isSessionInvalid(statusCode int, errorBody []byte) bool {

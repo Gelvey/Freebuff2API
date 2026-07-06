@@ -21,6 +21,22 @@ const (
 	modelRefreshInterval  = 6 * time.Hour
 )
 
+// rootAgentByModel maps each selectable free-mode model to the root agent
+// the upstream backend expects for chat completions.  Subagents (file-picker,
+// basher, etc.) must run under these roots, so choosing them directly causes
+// upstream to reject the request with "free_mode_invalid_agent_hierarchy".
+// Source: CodebuffAI/codebuff common/src/constants/free-agents.ts
+var rootAgentByModel = map[string]string{
+	"minimax/minimax-m2.7":              "base2-free",
+	"minimax/minimax-m3":                "base2-free-minimax-m3",
+	"deepseek/deepseek-v4-pro":          "base2-free-deepseek",
+	"deepseek/deepseek-v4-flash":        "base2-free-deepseek-flash",
+	"moonshotai/kimi-k2.6":              "base2-free-kimi",
+	"mimo/mimo-v2.5":                    "base2-free-mimo",
+	"mimo/mimo-v2.5-pro":                "base2-free-mimo-pro",
+	"z-ai/glm-5.2":                      "base2-free-glm",
+}
+
 // hardcodedFallback is used when the remote fetch fails on startup.
 // Last updated: 2026-07-05 from CodebuffAI/codebuff freebuff-models.ts.
 var hardcodedFallback = map[string][]string{
@@ -313,7 +329,8 @@ func parseAllFreeModels(source string, constants map[string]string) map[string][
 }
 
 // buildModelMapping creates the model→agent reverse mapping and deduplicated model list.
-// When a model appears in multiple agents, one is chosen at random.
+// When a model appears in multiple agents, the upstream root agent is preferred;
+// otherwise one agent is chosen at random.
 func buildModelMapping(agentModels map[string][]string) (map[string]string, []string) {
 	modelAgents := make(map[string][]string)
 	for agentID, models := range agentModels {
@@ -325,7 +342,11 @@ func buildModelMapping(agentModels map[string][]string) (map[string]string, []st
 	modelToAgent := make(map[string]string, len(modelAgents))
 	allModels := make([]string, 0, len(modelAgents))
 	for model, agents := range modelAgents {
-		modelToAgent[model] = agents[rand.Intn(len(agents))]
+		if root, ok := rootAgentByModel[model]; ok && containsString(agents, root) {
+			modelToAgent[model] = root
+		} else {
+			modelToAgent[model] = agents[rand.Intn(len(agents))]
+		}
 		allModels = append(allModels, model)
 	}
 	sort.Strings(allModels)

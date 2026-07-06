@@ -157,9 +157,6 @@ func (m *RunManager) prewarm(agentIDs []string) {
 	defer cancel()
 
 	for _, pool := range m.pools {
-		if _, err := pool.ensureSession(ctx); err != nil {
-			m.logger.Printf("%s: free session prewarm failed: %v", pool.name, err)
-		}
 		for _, agentID := range agentIDs {
 			if err := pool.rotateAgent(ctx, agentID); err != nil {
 				m.logger.Printf("%s: prewarm %s failed: %v", pool.name, agentID, err)
@@ -180,7 +177,7 @@ func (m *RunManager) Close(ctx context.Context) {
 	}
 }
 
-func (m *RunManager) Acquire(ctx context.Context, agentID string) (*runLease, error) {
+func (m *RunManager) Acquire(ctx context.Context, agentID, model string) (*runLease, error) {
 	if len(m.pools) == 0 {
 		return nil, errors.New("no auth tokens configured")
 	}
@@ -190,7 +187,7 @@ func (m *RunManager) Acquire(ctx context.Context, agentID string) (*runLease, er
 	var waiting []*waitingRoomError
 	for offset := 0; offset < len(m.pools); offset++ {
 		pool := m.pools[(startIndex+offset)%len(m.pools)]
-		lease, err := pool.acquire(ctx, agentID)
+		lease, err := pool.acquire(ctx, agentID, model)
 		if err == nil {
 			return lease, nil
 		}
@@ -245,7 +242,7 @@ func (m *RunManager) Snapshots() []tokenSnapshot {
 	return snapshots
 }
 
-func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, error) {
+func (p *tokenPool) acquire(ctx context.Context, agentID, model string) (*runLease, error) {
 	p.mu.Lock()
 	if now := time.Now(); now.Before(p.cooldownUntil) {
 		cooldownUntil := p.cooldownUntil
@@ -262,7 +259,7 @@ func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, err
 		}
 	}
 
-	if _, err := p.ensureSession(ctx); err != nil {
+	if _, err := p.ensureSession(ctx, model); err != nil {
 		return nil, err
 	}
 
@@ -278,7 +275,7 @@ func (p *tokenPool) acquire(ctx context.Context, agentID string) (*runLease, err
 }
 
 func (p *tokenPool) maintain(ctx context.Context) error {
-	if _, err := p.ensureSession(ctx); err != nil {
+	if _, err := p.ensureSession(ctx, ""); err != nil {
 		p.logger.Printf("%s: refresh free session failed: %v", p.name, err)
 	}
 
