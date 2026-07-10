@@ -390,23 +390,63 @@ func (s *Server) injectUpstreamMetadata(payload map[string]any, requestedModel, 
 
 const freebuffSystemMarker = "You are Buffy"
 
+// ensureFreebuffSystemMarker makes the request satisfy upstream's
+// requestHasFreebuffSystemMarker gate (which requires "You are Buffy" in a
+// system message) while keeping a *single* system message — the shape the
+// official CLI sends, where the marker is embedded in one full agent system
+// prompt.  Prepending a second, separate marker message (as a naive
+// implementation would) produces two system messages, a fingerprint the CLI
+// never emits.
 func ensureFreebuffSystemMarker(payload map[string]any) {
 	messages, ok := payload["messages"].([]any)
 	if !ok {
 		return
 	}
+
 	for _, raw := range messages {
 		msg, ok := raw.(map[string]any)
 		if !ok {
 			continue
 		}
-		if strings.EqualFold(strings.TrimSpace(fmt.Sprint(msg["role"])), "system") {
-			if strings.Contains(fmt.Sprint(msg["content"]), freebuffSystemMarker) {
+		if !strings.EqualFold(strings.TrimSpace(fmt.Sprint(msg["role"])), "system") {
+			continue
+		}
+
+		switch content := msg["content"].(type) {
+		case string:
+			if strings.Contains(content, freebuffSystemMarker) {
 				return
 			}
+			msg["content"] = freebuffSystemMarker + "\n\n" + content
+			return
+		case []any:
+			for _, part := range content {
+				if pm, ok := part.(map[string]any); ok {
+					if strings.Contains(fmt.Sprint(pm["text"]), freebuffSystemMarker) {
+						return
+					}
+				}
+			}
+			msg["content"] = append(
+				[]any{map[string]any{"type": "text", "text": freebuffSystemMarker}},
+				content...,
+			)
+			return
+		default:
+			text := fmt.Sprint(msg["content"])
+			if strings.Contains(text, freebuffSystemMarker) {
+				return
+			}
+			msg["content"] = freebuffSystemMarker + "\n\n" + text
+			return
 		}
 	}
-	payload["messages"] = append([]any{map[string]any{"role": "system", "content": freebuffSystemMarker}}, messages...)
+
+	// No system message at all — prepend a standalone marker so the gate passes.
+	payload["messages"] = append(
+		[]any{map[string]any{"role": "system", "content": freebuffSystemMarker}},
+		messages...,
+	)
 }
 
 func isSessionInvalid(statusCode int, errorBody []byte) bool {
